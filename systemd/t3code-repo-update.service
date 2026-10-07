@@ -1,0 +1,11 @@
+[Unit]
+Description=Build new T3 Code releases into the local t3code-local pacman repo
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin
+ExecStart=@PKG_DIR@/t3code-repo-update
+Nice=15
+IOSchedulingClass=idle

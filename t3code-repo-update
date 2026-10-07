@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Builds the latest stable T3 Code release into a local pacman repo, so
+# checkupdates/arch-update see it like any other repo package.
+#
+#   t3code-repo-update           build only if upstream has a newer release
+#   t3code-repo-update --force   rebuild the current release regardless
+set -euo pipefail
+
+PKG_DIR=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+REPO_NAME=t3code-local
+# Must be outside $HOME: pacman downloads as the sandboxed 'alpm' user, which
+# can't traverse a 0700 home directory even for file:// repos.
+REPO_DIR=${T3CODE_REPO_DIR:-/srv/t3code-repo}
+WORK_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/t3code-pkg
+DB="$REPO_DIR/$REPO_NAME.db.tar.gz"
+
+force=0
+[[ ${1:-} == --force ]] && force=1
+
+log() { printf '[t3code-repo-update] %s\n' "$*"; }
+die() { log "error: $*" >&2; exit 1; }
+
+notify() {
+  command -v notify-send >/dev/null && [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]] &&
+    notify-send -a 't3code-repo-update' -i software-update-available "$@" || true
+}
+
+[[ -d $REPO_DIR && -w $REPO_DIR ]] || die "$REPO_DIR missing or not writable; run setup.sh"
+mkdir -p "$WORK_DIR"/{build,src}
+exec 9>"$WORK_DIR/lock"
+flock -n 9 || die 'another update is already running'
+
+latest=$(
+  curl -fsSL --retry 3 -H 'Accept: application/vnd.github+json' \
+    https://api.github.com/repos/pingdotgg/t3code/releases/latest |
+    sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' | head -n1
+)
+[[ $latest =~ ^[0-9]+(\.[0-9]+)*$ ]] || die "unexpected latest release tag: '${latest:-<none>}'"
+
+current=
+if [[ -f $DB ]]; then
+  current=$(bsdtar -xOf "$DB" 't3code-*/desc' 2>/dev/null |
+    awk '/^%VERSION%$/ { getline; sub(/-[^-]*$/, ""); print; exit }')
+fi
+
+if (( ! force )) && [[ -n $current ]] && (( $(vercmp "$latest" "$current") <= 0 )); then
+  log "up to date ($current)"
+  exit 0
+fi
+
+log "building t3code $latest (repo has: ${current:-nothing})"
+
+pkgbuild="$PKG_DIR/PKGBUILD"
+if [[ $(sed -n 's/^pkgver=//p' "$pkgbuild") != "$latest" ]]; then
+  sed -i -e "s/^pkgver=.*/pkgver=$latest/" -e 's/^pkgrel=.*/pkgrel=1/' "$pkgbuild"
+fi
+
+cd "$PKG_DIR"
+export BUILDDIR="$WORK_DIR/build" SRCDEST="$WORK_DIR/src" PKGDEST="$REPO_DIR"
+if ! makepkg --cleanbuild --force --noconfirm; then
+  notify 'T3 Code build failed' "Could not build $latest. Run t3code-repo-update manually to see why."
+  die "makepkg failed for $latest"
+fi
+
+mapfile -t built < <(makepkg --packagelist)
+for f in "${built[@]}"; do
+  [[ -f $f ]] || die "expected package not found: $f"
+done
+repo-add --remove --new "$DB" "${built[@]}"
+rm -rf "$BUILDDIR/t3code"
+
+log "t3code $latest added to $REPO_NAME"
+notify 'T3 Code update ready' "$latest was built and will show up in arch-update."
